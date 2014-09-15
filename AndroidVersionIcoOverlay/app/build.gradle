@@ -1,0 +1,198 @@
+import groovy.io.FileType
+import groovy.text.SimpleTemplateEngine
+import java.util.regex.Pattern
+
+apply plugin: 'com.android.application'
+apply plugin: AppIconOverlayPlugin
+
+def getVerCode = { ->
+
+    def code = 1;
+    def File versionPropsFile = file('version.properties')
+    def Properties versionProps = new Properties()
+    try {
+        if (versionPropsFile.exists()) {
+            if (versionPropsFile.canRead()) {
+                versionProps.load(new FileInputStream(versionPropsFile))
+                code = versionProps['VERSION_CODE'].toInteger()
+            }
+        } else {
+            if (versionPropsFile.createNewFile()) {
+                versionProps['VERSION_CODE'] = code.toString()
+                versionProps.store(versionPropsFile.newWriter(), null)
+            }
+        }
+    } catch (e) {
+        logger.debug(e.getLocalizedMessage())
+    }
+    return code
+}
+android {
+    compileSdkVersion 20
+    buildToolsVersion "20"
+
+    defaultConfig {
+        applicationId "m10.ua.kh.mobiledevs.androidversionicooverlay"
+        minSdkVersion 14
+        targetSdkVersion 20
+        versionCode getVerCode()
+        versionName "1.0"
+    }
+    buildTypes {
+        release {
+            runProguard false
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+    }
+}
+
+task('increaseVersionCode') << {
+    def code = getVerCode()
+    def File versionPropsFile = file('version.properties')
+    def Properties versionProps = new Properties()
+    try {
+        versionProps.load(new FileInputStream(versionPropsFile))
+        if (versionPropsFile.canWrite()) {
+            versionProps['VERSION_CODE'] = (code + 1).toString()
+            versionProps.store(versionPropsFile.newWriter(), null)
+        }
+
+    } catch (e) {
+        logger.debug(e.getLocalizedMessage())
+    }
+/**
+* Old approach with version in manifest file
+ */
+
+//    def manifestFile = file("src/main/AndroidManifest.xml")
+//    def pattern = Pattern.compile("versionCode=\"(\\d+)\"")
+//    def manifestText = manifestFile.getText()
+//    def matcher = pattern.matcher(manifestText)
+//    matcher.find()
+//    def versionCode = Integer.parseInt(matcher.group(1))
+//    def manifestContent = matcher.replaceAll("versionCode=\"" + ++versionCode + "\"")
+//    manifestFile.write(manifestContent)
+}
+
+dependencies {
+    compile fileTree(dir: 'libs', include: ['*.jar'])
+}
+
+class AppIconOverlayPlugin implements Plugin<Project> {
+    private static final String TASK_NAME = "overlayicon"
+
+    void apply(Project project) {
+        def log = project.logger
+        project.extensions.create("appiconoverlay", AppIconOverlayExtension)
+        project.android.applicationVariants.all { variant ->
+/* skip release builds */
+            if (variant.buildType.name.equals("release")) {
+                log.debug("Skipping build type: ${variant.buildType.name}")
+                return;
+            }
+            System.setProperty('java.awt.headless', 'true')
+/* set up overlay task */
+            def overlayTask = project.task(type: OverlayTask, "${TASK_NAME}${variant.buildType.name}") {
+                manifestFile = variant.processManifest.manifestOutputFile
+                resourcesPath = variant.mergeResources.outputDir
+            }
+/* hook overlay task into android build chain */
+            overlayTask.dependsOn variant.processManifest
+            variant.processResources.dependsOn overlayTask
+        }
+    }
+}
+
+class AppIconOverlayExtension {
+/**
+ * Text color in #rrggbbaa format.
+ */
+    String textColor = "#FFF"
+/**
+ * Background color for overlay in #rrggbbaa format.
+ */
+    String backgroundColor = "#0008"
+/**
+ * Format string to be used to create the text in the overlay.
+ * Note: Use single quotes, it's a GString.
+ * The following variables are available:
+ * - $branch: name of git branch
+ * - $commit: short SHA1 of latest commit in current branch
+ * - $version: name of the app version
+ * - $code: code of the version
+ */
+    String format = '$version\n$code'
+/**
+ * Command to invoke to run ImageMagick's "convert".
+ */
+    String imageMagick = "convert"
+}
+
+class OverlayTask extends DefaultTask {
+    File manifestFile
+    File resourcesPath
+
+    @TaskAction
+    def overlay() {
+/*
+* parse AndroidManifest.xml
+* find file name for app icon in <application .. android:icon="@drawable/ic_launcher">
+*/
+        def manifestXml = new XmlSlurper().parse(manifestFile)
+        def iconFileName = manifestXml.application.@icon.text().split("/")[1]
+        def versionCode = manifestXml.@versionCode.text()
+        def versionName = manifestXml.@versionName.text()
+
+/* find the app icon files in all 'drawable' folders */
+        resourcesPath.eachDirMatch(~/^drawable.*/) { dir ->
+            dir.eachFileMatch(FileType.FILES, ~"^${iconFileName}.*") { file ->
+                logger.debug("found file: ${file}")
+                def img = javax.imageio.ImageIO.read(file);
+                def formatBinding = ['branch': queryGit("abbrev-ref"), 'commit': queryGit("short"), 'version': versionName, 'code': versionCode]
+                def caption = new SimpleTemplateEngine().createTemplate(project.appiconoverlay.format).make(formatBinding)
+/* invoke ImageMagick */
+
+
+                try {
+
+                    def imagemagick = ["${project.appiconoverlay.imageMagick}",
+                                       "-background", "${project.appiconoverlay.backgroundColor}",
+                                       "-fill", "${project.appiconoverlay.textColor}",
+                                       "-gravity", "center",
+                                       "-size", "${img.width}x${img.height / 2}",
+                                       "caption:${caption}",
+                                       file,
+                                       "+swap",
+                                       "-gravity", "south",
+                                       "-composite",
+                                       file]
+                            .execute()
+                    imagemagick.waitFor()
+/* print error, if any */
+                    if (imagemagick.exitValue() != 0) {
+                        logger.error("ImageMagick with error code ${imagemagick.exitValue()} and: ${imagemagick.err.text}")
+                    }
+
+                } catch (e) {
+                    logger.debug(e.getLocalizedMessage())
+                }
+
+            }
+        }
+    }
+
+    def queryGit(def command) {
+        def args = ["git", "rev-parse", "--${command}", "HEAD"]
+        logger.debug("executing git: ${args.join(' ')}")
+        def git = args.execute(null, project.projectDir)
+        git.waitFor()
+        git.in.text.replaceAll(/\s/, "")
+    }
+}
+
+appiconoverlay {
+    textColor '#FFF'           /* #rrggbbaa format */
+    backgroundColor "#0008"    /* #rrggbbaa format */
+    format '$version\n$code'  /* GString */
+    imageMagick '/opt/local/bin/convert'      /* command to run ImageMagick */
+}
